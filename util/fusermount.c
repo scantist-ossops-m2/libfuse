@@ -29,6 +29,8 @@
 #include <sys/socket.h>
 #include <sys/utsname.h>
 #include <sched.h>
+#include <stdbool.h>
+#include <sys/vfs.h>
 
 #define FUSE_COMMFD_ENV		"_FUSE_COMMFD"
 
@@ -565,10 +567,19 @@ static void read_conf(void)
 			fprintf(stderr, "%s: reading %s: missing newline at end of file\n", progname, FUSE_CONF);
 
 		}
+		if (ferror(fp)) {
+			fprintf(stderr, "%s: reading %s: read failed\n", progname, FUSE_CONF);
+			exit(1);
+		}
 		fclose(fp);
 	} else if (errno != ENOENT) {
+		bool fatal = (errno != EACCES && errno != ELOOP &&
+			      errno != ENAMETOOLONG && errno != ENOTDIR &&
+			      errno != EOVERFLOW);
 		fprintf(stderr, "%s: failed to open %s: %s\n",
 			progname, FUSE_CONF, strerror(errno));
+		if (fatal)
+			exit(1);
 	}
 }
 
@@ -712,6 +723,23 @@ static int get_string_opt(const char *s, unsigned len, const char *opt,
 	return 1;
 }
 
+/* The kernel silently truncates the "data" argument to PAGE_SIZE-1 characters.
+ * This can be dangerous if it e.g. truncates the option "group_id=1000" to
+ * "group_id=1".
+ * This wrapper detects this case and bails out with an error.
+ */
+static int mount_notrunc(const char *source, const char *target,
+			 const char *filesystemtype, unsigned long mountflags,
+			 const char *data) {
+	if (strlen(data) > sysconf(_SC_PAGESIZE) - 1) {
+		fprintf(stderr, "%s: mount options too long\n", progname);
+		errno = EINVAL;
+		return -1;
+	}
+	return mount(source, target, filesystemtype, mountflags, data);
+}
+
+
 static int do_mount(const char *mnt, char **typep, mode_t rootmode,
 		    int fd, const char *opts, const char *dev, char **sourcep,
 		    char **mnt_optsp, off_t rootsize)
@@ -739,8 +767,10 @@ static int do_mount(const char *mnt, char **typep, mode_t rootmode,
 		unsigned len;
 		const char *fsname_str = "fsname=";
 		const char *subtype_str = "subtype=";
+		bool escape_ok = begins_with(s, fsname_str) ||
+				 begins_with(s, subtype_str);
 		for (len = 0; s[len]; len++) {
-			if (s[len] == '\\' && s[len + 1])
+			if (escape_ok && s[len] == '\\' && s[len + 1])
 				len++;
 			else if (s[len] == ',')
 				break;
@@ -794,10 +824,16 @@ static int do_mount(const char *mnt, char **typep, mode_t rootmode,
 						flags |= flag;
 					else
 						flags  &= ~flag;
-				} else {
+				} else if (opt_eq(s, len, "default_permissions") ||
+					   opt_eq(s, len, "allow_other") ||
+					   begins_with(s, "max_read=") ||
+					   begins_with(s, "blksize=")) {
 					memcpy(d, s, len);
 					d += len;
 					*d++ = ',';
+				} else {
+					fprintf(stderr, "%s: unknown option '%.*s'\n", progname, len, s);
+					exit(1);
 				}
 			}
 		}
@@ -836,7 +872,7 @@ static int do_mount(const char *mnt, char **typep, mode_t rootmode,
 	else
 		strcpy(source, subtype ? subtype : dev);
 
-	res = mount(source, mnt, type, flags, optbuf);
+	res = mount_notrunc(source, mnt, type, flags, optbuf);
 	if (res == -1 && errno == ENODEV && subtype) {
 		/* Probably missing subtype support */
 		strcpy(type, blkdev ? "fuseblk" : "fuse");
@@ -847,13 +883,13 @@ static int do_mount(const char *mnt, char **typep, mode_t rootmode,
 			strcpy(source, type);
 		}
 
-		res = mount(source, mnt, type, flags, optbuf);
+		res = mount_notrunc(source, mnt, type, flags, optbuf);
 	}
 	if (res == -1 && errno == EINVAL) {
 		/* It could be an old version not supporting group_id */
 		sprintf(d, "fd=%i,rootmode=%o,user_id=%u",
 			fd, rootmode, getuid());
-		res = mount(source, mnt, type, flags, optbuf);
+		res = mount_notrunc(source, mnt, type, flags, optbuf);
 	}
 	if (res == -1) {
 		int errno_save = errno;
@@ -919,6 +955,8 @@ static int check_perm(const char **mntp, struct stat *stbuf, int *mountpoint_fd)
 	int res;
 	const char *mnt = *mntp;
 	const char *origmnt = mnt;
+	struct statfs fs_buf;
+	size_t i;
 
 	res = lstat(mnt, stbuf);
 	if (res == -1) {
@@ -991,8 +1029,53 @@ static int check_perm(const char **mntp, struct stat *stbuf, int *mountpoint_fd)
 		return -1;
 	}
 
+	/* Do not permit mounting over anything in procfs - it has a couple
+	 * places to which we have "write access" without being supposed to be
+	 * able to just put anything we want there.
+	 * Luckily, without allow_other, we can't get other users to actually
+	 * use any fake information we try to put there anyway.
+	 * Use a whitelist to be safe. */
+	if (statfs(*mntp, &fs_buf)) {
+		fprintf(stderr, "%s: failed to access mountpoint %s: %s\n",
+			progname, mnt, strerror(errno));
+		return -1;
+	}
 
-	return 0;
+	/* Use the same list of permitted filesystems for the mount target as
+	 * the ecryptfs mount helper
+	 * (https://bazaar.launchpad.net/~ecryptfs/ecryptfs/trunk/view/head:/src/utils/mount.ecryptfs_private.c#L225). */
+	typeof(fs_buf.f_type) f_type_whitelist[] = {
+		0x61756673 /* AUFS_SUPER_MAGIC */,
+		0x9123683E /* BTRFS_SUPER_MAGIC */,
+		0x00C36400 /* CEPH_SUPER_MAGIC */,
+		0xFF534D42 /* CIFS_MAGIC_NUMBER */,
+		0x0000F15F /* ECRYPTFS_SUPER_MAGIC */,
+		0x0000EF53 /* EXT[234]_SUPER_MAGIC */,
+		0xF2F52010 /* F2FS_SUPER_MAGIC */,
+		0x65735546 /* FUSE_SUPER_MAGIC */,
+		0x01161970 /* GFS2_MAGIC */,
+		0x3153464A /* JFS_SUPER_MAGIC */,
+		0x000072B6 /* JFFS2_SUPER_MAGIC */,
+		0x0000564C /* NCP_SUPER_MAGIC */,
+		0x00006969 /* NFS_SUPER_MAGIC */,
+		0x00003434 /* NILFS_SUPER_MAGIC */,
+		0x5346544E /* NTFS_SB_MAGIC */,
+		0x794C7630 /* OVERLAYFS_SUPER_MAGIC */,
+		0x52654973 /* REISERFS_SUPER_MAGIC */,
+		0x73717368 /* SQUASHFS_MAGIC */,
+		0x01021994 /* TMPFS_MAGIC */,
+		0x24051905 /* UBIFS_SUPER_MAGIC */,
+		0x58465342 /* XFS_SB_MAGIC */,
+		0x2FC12FC1 /* ZFS_SUPER_MAGIC */,
+	};
+	for (i = 0; i < sizeof(f_type_whitelist)/sizeof(f_type_whitelist[0]); i++) {
+		if (f_type_whitelist[i] == fs_buf.f_type)
+			return 0;
+	}
+
+	fprintf(stderr, "%s: mounting over filesystem type %#010lx is forbidden\n",
+		progname, (unsigned long)fs_buf.f_type);
+	return -1;
 }
 
 static int try_open(const char *dev, char **devp, int silent)
